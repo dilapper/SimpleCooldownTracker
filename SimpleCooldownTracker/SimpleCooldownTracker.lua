@@ -300,6 +300,10 @@ f:SetScript('OnEvent', function(self, event, arg1)
 		container:SetScript('OnMouseDown', function(c) c:StartMoving() end)
 		container:SetScript('OnMouseUp', function(c) c:StopMovingOrSizing() end)
 
+		-- SetScript('OnMouseDown') enables mouse input; the locked state must not
+		-- swallow clicks (e.g. right-click camera rotation).
+		container:EnableMouse(false)
+
 		for i = 1, MAXBARS do bars[i] = CreateBar() end
 		PositionBars()
 
