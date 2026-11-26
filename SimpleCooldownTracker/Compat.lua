@@ -20,3 +20,9 @@ end
 if not _G.UnitDebuff then
 	function UnitDebuff() end
 end
+
+-- True for "secret" values (Forever/Midnight-era clients), which cannot be
+-- used as table keys or compared. Always false on clients without the API.
+function IsSecret(value)
+	return _G.issecretvalue ~= nil and _G.issecretvalue(value) or false
+end

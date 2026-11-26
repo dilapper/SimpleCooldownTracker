@@ -225,12 +225,14 @@ function TargetDebuffs()
 end
 
 function UNIT_SPELLCAST_SENT(_, _, _, spell)
+	if IsSecret(spell) then return end
 	if SPECIAL_EVENT[spell] then
 		SetEffectDurations(spell)
 	end
 end
 
 function UNIT_SPELLCAST_SUCCEEDED(_, _, spell)
+	if IsSecret(spell) then return end
 	SetEffectDurations(spell)
 end
 
@@ -403,6 +405,10 @@ end
 
 function COMBAT_LOG_EVENT_UNFILTERED()
 	local _, event, _, source, _, _, _, unit, unit_name, _, _, spell, effect_name = CombatLogGetCurrentEventInfo()
+
+	if IsSecret(event) or IsSecret(source) or IsSecret(unit) or IsSecret(effect_name) then
+		return
+	end
 
 	if event == 'UNIT_DIED' then
 		UnitDied(unit)
