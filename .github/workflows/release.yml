@@ -1,0 +1,39 @@
+name: Release
+
+# Runs when a version tag like v1.0.0 is pushed, or manually for an existing tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to release (e.g. v1.0.0)"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+
+      - name: Check .toc version matches tag
+        run: |
+          toc_version=$(grep -m1 '^## Version:' SimpleCooldownTracker/SimpleCooldownTracker.toc | sed 's/^## Version:[[:space:]]*//' | tr -d '\r')
+          if [ "v$toc_version" != "$TAG" ]; then
+            echo "::error::TOC version 'v$toc_version' does not match tag '$TAG'"
+            exit 1
+          fi
+
+      - name: Build addon zip
+        run: zip -r SimpleCooldownTracker.zip SimpleCooldownTracker
+
+      - name: Create GitHub release
+        run: gh release create "$TAG" SimpleCooldownTracker.zip --title "$TAG" --generate-notes --verify-tag

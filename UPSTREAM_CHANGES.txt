@@ -1,0 +1,10 @@
+lightweight tag 4af621fa8a6913a76daf82d6851ea6416de7cc36 v1.2.12
+Author:	Simon Hirsig <simon.hirsig@gmail.com>
+Date:	Mon Jan 19 19:31:39 2026 +0100
+
+commit 4af621fa8a6913a76daf82d6851ea6416de7cc36
+Author: Simon Hirsig <simon.hirsig@gmail.com>
+Date:   Mon Jan 19 19:31:39 2026 +0100
+
+    client version bump
+
