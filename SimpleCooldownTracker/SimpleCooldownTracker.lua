@@ -14,7 +14,6 @@ local defaults = { invert = false, growth = 'up', scale = 1, alpha = .85, plates
 
 local bars, container = {}, nil
 local locked, dirty = true, true
-local ccFilterOK = true
 local TRACE = false
 
 local function Print(msg) DEFAULT_CHAT_FRAME:AddMessage('<SCT> ' .. msg) end
@@ -104,9 +103,77 @@ local function SameUnit(a, b)
 	return same
 end
 
+-- Auras we know about, per unit token: tracked[unit][auraInstanceID] = auraData.
+-- In combat the client refuses to let addons enumerate auras ("secret" auras),
+-- so we build this list from the UNIT_AURA event payload instead and filter it
+-- with the ID-based filter check, which stays usable.
+local tracked = {}
+
+local function FilteredOut(unit, id, filter)
+	if not (C_UnitAuras and C_UnitAuras.IsAuraFilteredOutByInstanceID) then return false end
+	local ok, out = pcall(C_UnitAuras.IsAuraFilteredOutByInstanceID, unit, id, filter)
+	if not ok then
+		if TRACE then Print(('filter check failed on %s: %s'):format(unit, tostring(out))) end
+		return true
+	end
+	if IsSecret(out) then return false end
+	return out and true or false
+end
+
+local function TrackAdd(unit, data)
+	local id = data and data.auraInstanceID
+	if not id or IsSecret(id) then return end
+	if FilteredOut(unit, id, FILTER_ALL) then return end -- not our debuff
+	tracked[unit] = tracked[unit] or {}
+	tracked[unit][id] = data
+end
+
+-- Full rescan; only possible when the client lets us enumerate (usually out of combat).
+local function Rescan(unit)
+	local ids, err = AuraIDs(unit, FILTER_ALL)
+	if not ids then
+		if TRACE then Print(('rescan %s unavailable: %s'):format(unit, tostring(err))) end
+		return false
+	end
+	tracked[unit] = {}
+	for _, id in ipairs(ids) do
+		local ok, data = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unit, id)
+		if ok and data then TrackAdd(unit, data) end
+	end
+	return true
+end
+
+local function OnUnitAura(unit, info)
+	if not info or info.isFullUpdate then
+		if not Rescan(unit) and info and info.isFullUpdate and not UnitExists(unit) then
+			tracked[unit] = nil
+		end
+	else
+		if info.addedAuras then
+			for _, data in ipairs(info.addedAuras) do TrackAdd(unit, data) end
+		end
+		if info.updatedAuraInstanceIDs and tracked[unit] then
+			for _, id in ipairs(info.updatedAuraInstanceIDs) do
+				if tracked[unit][id] then
+					local ok, data = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unit, id)
+					if ok and data then tracked[unit][id] = data end
+				end
+			end
+		end
+		if info.removedAuraInstanceIDs and tracked[unit] then
+			for _, id in ipairs(info.removedAuraInstanceIDs) do tracked[unit][id] = nil end
+		end
+	end
+	if TRACE then
+		local n = 0
+		for _ in pairs(tracked[unit] or {}) do n = n + 1 end
+		Print(('tracked %s: %d player debuff(s)'):format(unit, n))
+	end
+end
+
 local function Collect()
 	local s = Settings()
-	local filter = (s.all or not ccFilterOK) and FILTER_ALL or FILTER_CC
+	local filter = s.all and FILTER_ALL or FILTER_CC
 	local entries = {}
 
 	local units = { 'target', 'focus' }
@@ -115,24 +182,17 @@ local function Collect()
 	end
 
 	for idx, unit in ipairs(units) do
-		if UnitExists(unit) then
+		if tracked[unit] and UnitExists(unit) then
 			local skip = false
 			-- avoid showing the same mob twice (focus/nameplate duplicates of an earlier unit)
 			for j = 1, idx - 1 do
 				if UnitExists(units[j]) and SameUnit(unit, units[j]) then skip = true break end
 			end
 			if not skip then
-				local ids, err = AuraIDs(unit, filter)
-				if not ids then
-					Print(("aura query failed on %s [%s]: %s"):format(unit, filter, tostring(err)))
-					if filter == FILTER_CC then ids = AuraIDs(unit, FILTER_ALL) end
-				end
-				if TRACE then Print(("scan %s [%s] -> %s"):format(unit, filter, ids and #ids or "nil")) end
-				for _, id in ipairs(ids or {}) do
-					local data = C_UnitAuras.GetAuraDataByAuraInstanceID(unit, id)
-					if data then
-						local dur = C_UnitAuras.GetAuraDuration and C_UnitAuras.GetAuraDuration(unit, id)
-						entries[#entries + 1] = { unit = unit, data = data, duration = dur }
+				for id, data in pairs(tracked[unit]) do
+					if not FilteredOut(unit, id, filter) then
+						local ok, dur = pcall(C_UnitAuras.GetAuraDuration, unit, id)
+						entries[#entries + 1] = { unit = unit, data = data, duration = ok and dur or nil }
 					end
 				end
 			end
@@ -229,7 +289,7 @@ end
 
 local function Debug()
 	local unit = 'target'
-	Print(('debug: locked=%s ccFilterOK=%s bars=%d'):format(tostring(locked), tostring(ccFilterOK), #bars))
+	Print(('debug: locked=%s bars=%d'):format(tostring(locked), #bars))
 	Print(('debug: C_UnitAuras=%s GetUnitAuraInstanceIDs=%s GetAuraDuration=%s SetTimerDuration=%s'):format(
 		tostring(C_UnitAuras ~= nil), tostring(C_UnitAuras and C_UnitAuras.GetUnitAuraInstanceIDs ~= nil),
 		tostring(C_UnitAuras and C_UnitAuras.GetAuraDuration ~= nil),
@@ -291,7 +351,7 @@ end
 
 local f = CreateFrame('Frame')
 f:RegisterEvent('ADDON_LOADED')
-f:SetScript('OnEvent', function(self, event, arg1)
+f:SetScript('OnEvent', function(self, event, arg1, arg2)
 	if event == 'ADDON_LOADED' then
 		if arg1 ~= ADDON then return end
 		self:UnregisterEvent('ADDON_LOADED')
@@ -331,7 +391,20 @@ f:SetScript('OnEvent', function(self, event, arg1)
 		Print('loaded - /sct')
 	elseif event == 'UNIT_AURA' then
 		if TRACE then Print('UNIT_AURA ' .. tostring(IsSecret(arg1) and '<secret>' or arg1) .. (RelevantUnit(arg1) and ' (relevant)' or ' (ignored)')) end
-		if RelevantUnit(arg1) then dirty = true end
+		if RelevantUnit(arg1) then
+			OnUnitAura(arg1, arg2)
+			dirty = true
+		end
+	elseif event == "NAME_PLATE_UNIT_REMOVED" then
+		if type(arg1) == "string" then tracked[arg1] = nil end
+		dirty = true
+	elseif event == "PLAYER_TARGET_CHANGED" or event == "PLAYER_FOCUS_CHANGED" or event == "NAME_PLATE_UNIT_ADDED" then
+		local unit = event == "PLAYER_TARGET_CHANGED" and "target" or event == "PLAYER_FOCUS_CHANGED" and "focus" or arg1
+		if type(unit) == "string" and RelevantUnit(unit) then
+			tracked[unit] = nil
+			Rescan(unit)
+		end
+		dirty = true
 	else
 		dirty = true
 	end
