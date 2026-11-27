@@ -15,6 +15,7 @@ local defaults = { invert = false, growth = 'up', scale = 1, alpha = .85, plates
 local bars, container = {}, nil
 local locked, dirty = true, true
 local ccFilterOK = true
+local TRACE = false
 
 local function Print(msg) DEFAULT_CHAT_FRAME:AddMessage('<SCT> ' .. msg) end
 
@@ -223,10 +224,16 @@ local function Usage()
 	Print('  plates   (toggle tracking on nameplates)')
 	Print('  all      (toggle showing all your debuffs, not only CCs)')
 	Print('  debug    (print what the addon sees on your target)')
+	Print('  trace    (toggle printing every aura event, for debugging)')
 end
 
 local function Debug()
 	local unit = 'target'
+	Print(('debug: locked=%s ccFilterOK=%s bars=%d'):format(tostring(locked), tostring(ccFilterOK), #bars))
+	Print(('debug: C_UnitAuras=%s GetUnitAuraInstanceIDs=%s GetAuraDuration=%s SetTimerDuration=%s'):format(
+		tostring(C_UnitAuras ~= nil), tostring(C_UnitAuras and C_UnitAuras.GetUnitAuraInstanceIDs ~= nil),
+		tostring(C_UnitAuras and C_UnitAuras.GetAuraDuration ~= nil),
+		tostring(bars[1] and bars[1].statusbar.SetTimerDuration ~= nil)))
 	if not UnitExists(unit) then Print('debug: no target') return end
 	for _, filter in ipairs({ FILTER_CC, FILTER_ALL }) do
 		local ids, err = AuraIDs(unit, filter)
@@ -271,7 +278,12 @@ local function Slash(msg)
 		s.all = not s.all
 		Print('Showing ' .. (s.all and 'all of your debuffs.' or 'crowd controls only.'))
 		dirty = true
-	elseif cmd == 'debug' then Debug()
+	elseif cmd == 'debug' then
+		local ok, err = pcall(Debug)
+		if not ok then Print('debug error: ' .. tostring(err)) end
+	elseif cmd == 'trace' then
+		TRACE = not TRACE
+		Print('Event trace ' .. (TRACE and 'on (watch chat while applying a CC).' or 'off.'))
 	else Usage() end
 end
 
@@ -318,6 +330,7 @@ f:SetScript('OnEvent', function(self, event, arg1)
 		self:RegisterEvent('NAME_PLATE_UNIT_REMOVED')
 		Print('loaded - /sct')
 	elseif event == 'UNIT_AURA' then
+		if TRACE then Print('UNIT_AURA ' .. tostring(IsSecret(arg1) and '<secret>' or arg1) .. (RelevantUnit(arg1) and ' (relevant)' or ' (ignored)')) end
 		if RelevantUnit(arg1) then dirty = true end
 	else
 		dirty = true
