@@ -1,11 +1,9 @@
 ## Interface: 16001
 ## Title: SimpleCooldownTracker
-## Notes: Progress bars for your own CCs and their diminishing returns. A WoW Forever port of ccc by Simon Hirsig (shirsig).
-## Author: Simon Hirsig (original ccc); ported to WoW Forever by dilapper
-## Version: 1.0.0
+## Notes: DEPRECATED - does not work on WoW Forever (aura data is secret in combat). Inspired by ccc by Simon Hirsig.
+## Author: dilapper (inspired by ccc by Simon Hirsig)
+## Version: 2.0.0
 ## SavedVariablesPerCharacter: SimpleCooldownTracker_settings
 ## IconTexture: Interface\Icons\Spell_Nature_Polymorph
 
-Compat.lua
-constants.lua
 SimpleCooldownTracker.lua

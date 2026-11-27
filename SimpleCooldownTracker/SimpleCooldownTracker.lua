@@ -1,641 +1,465 @@
-local addon_name, addon_table = ...
-setfenv(1, setmetatable(addon_table, { __index = _G }))
+-- SimpleCooldownTracker: crowd-control bars for the Forever client.
+-- Built on aura events and duration objects, so it never needs to read
+-- "secret" values (spell IDs, combat log) that the client hides from addons.
+-- Bar look and slash commands are adapted from ccc by Simon Hirsig.
 
-do
-	local f = CreateFrame'Frame'
-	f:SetScript('OnEvent', function(self, event, ...)
-		getfenv(1)[event](...)
-	end)
-	for _, event in pairs{
-		'ADDON_LOADED',
-		'UNIT_SPELLCAST_SENT',
-		'UNIT_SPELLCAST_SUCCEEDED',
-		'COMBAT_LOG_EVENT_UNFILTERED',
-		'CHAT_MSG_COMBAT_HONOR_GAIN',
-		'PLAYER_REGEN_ENABLED',
-		'PLAYER_TARGET_CHANGED',
-	} do f:RegisterEvent(event) end
-end
+local ADDON = ...
 
-_G.SimpleCooldownTracker_settings = {}
+local WIDTH, HEIGHT, MAXBARS, SPACING = 170, 16, 11, 4
+local TEXTURE = [[Interface\AddOns\SimpleCooldownTracker\bar]]
+local FILTER_CC = 'HARMFUL|PLAYER|CROWD_CONTROL'
+local FILTER_ALL = 'HARMFUL|PLAYER'
 
-local WIDTH = 170
-local HEIGHT = 16
-local MAXBARS = 11
+local defaults = { invert = false, growth = 'up', scale = 1, alpha = .85, plates = true, all = false }
 
-local BARS, TIMERS, EFFECT = {}, {}, {}
+local bars, container = {}, nil
+local locked, dirty = true, true
+local TRACE = false
 
-local LATEST_TARGET
+local function Print(msg) DEFAULT_CHAT_FRAME:AddMessage('<SCT> ' .. msg) end
 
-function Print(msg)
-	DEFAULT_CHAT_FRAME:AddMessage('<SCT> ' .. msg)
-end
+local function IsSecret(v) return issecretvalue ~= nil and issecretvalue(v) end
 
-function CreateBar()
-	local texture = [[Interface\AddOns\SimpleCooldownTracker\bar]]
-	local font, _, style = GameFontHighlight:GetFont()
-	local fontsize = 11
+local function Settings() return SimpleCooldownTracker_settings end
 
-	local f = CreateFrame('Frame', nil, UIParent)
+---------------------------------------------------------------- bars
 
-	f.fadetime = .5
-
+local function CreateBar()
+	local f = CreateFrame('Frame', nil, container)
 	f:SetHeight(HEIGHT)
 
 	f.icon = f:CreateTexture()
 	f.icon:SetWidth(HEIGHT)
-	f.icon:SetPoint('TOPLEFT', 0, 0)
-	f.icon:SetPoint('BOTTOMLEFT', 0, 0)
-	f.icon:SetTexture[[Interface\Icons\INV_Misc_QuestionMark]]
+	f.icon:SetPoint('TOPLEFT')
+	f.icon:SetPoint('BOTTOMLEFT')
 	f.icon:SetTexCoord(.08, .92, .08, .92)
 
-	f.statusbar = CreateFrame('StatusBar', nil, f, 'BackdropTemplate')
-	f.statusbar:SetPoint('TOPLEFT', f.icon, 'TOPRIGHT', 0, 0)
-	f.statusbar:SetPoint('BOTTOMRIGHT', 0, 0)
-	f.statusbar:SetStatusBarTexture(texture)
-	f.statusbar:SetStatusBarColor(.5, .5, .5, 1)
-	f.statusbar:SetMinMaxValues(0, 1)
-	f.statusbar:SetValue(1)
-	f.statusbar:SetBackdrop{ bgFile = texture }
-	f.statusbar:SetBackdropColor(.5, .5, .5, .3)
+	local sb = CreateFrame('StatusBar', nil, f, 'BackdropTemplate')
+	sb:SetPoint('TOPLEFT', f.icon, 'TOPRIGHT')
+	sb:SetPoint('BOTTOMRIGHT')
+	sb:SetStatusBarTexture(TEXTURE)
+	sb:SetStatusBarColor(.3, .9, .3)
+	sb:SetMinMaxValues(0, 1)
+	sb:SetBackdrop({ bgFile = TEXTURE })
+	sb:SetBackdropColor(.3, .9, .3, .3)
+	f.statusbar = sb
 
-	f.spark = f.statusbar:CreateTexture(nil, 'OVERLAY')
-	f.spark:SetTexture[[Interface\CastingBar\UI-CastingBar-Spark]]
-	f.spark:SetWidth(16)
-	f.spark:SetHeight(HEIGHT + 25)
-	f.spark:SetBlendMode'ADD'
-
-	f.text = f.statusbar:CreateFontString(nil, 'OVERLAY')
---	f.text:SetFontObject(GameFontHighlightSmallOutline)
-	f.text:SetFontObject(GameFontHighlight)
-	f.text:SetFont(font, fontsize, style)
+	local font, _, style = GameFontHighlight:GetFont()
+	f.text = sb:CreateFontString(nil, 'OVERLAY')
+	f.text:SetFont(font, 11, style)
 	f.text:SetPoint('TOPLEFT', 2, 0)
 	f.text:SetPoint('BOTTOMRIGHT', -2, 0)
-	f.text:SetJustifyH'LEFT'
-	f.text:SetText''
+	f.text:SetJustifyH('LEFT')
 
-	f.timertext = f.statusbar:CreateFontString(nil, 'OVERLAY')
---	f.text:SetFontObject(GameFontHighlightSmallOutline)
-	f.timertext:SetFontObject(GameFontHighlight)
-	f.timertext:SetFont(font, fontsize, style)
+	f.timertext = sb:CreateFontString(nil, 'OVERLAY')
+	f.timertext:SetFont(font, 11, style)
 	f.timertext:SetPoint('TOPLEFT', 2, 0)
 	f.timertext:SetPoint('BOTTOMRIGHT', -2, 0)
-	f.timertext:SetJustifyH'RIGHT'
-	f.timertext:SetText''
+	f.timertext:SetJustifyH('RIGHT')
 
+	f:Hide()
 	return f
 end
 
-function FadeBar(bar)
-	if bar.fadeelapsed > bar.fadetime then
-		bar:SetAlpha(0)
+local function PositionBars()
+	local up = Settings().growth == 'up'
+	for i, bar in ipairs(bars) do
+		local offset = (HEIGHT + SPACING) * (i - 1)
+		bar:ClearAllPoints()
+		if up then
+			bar:SetPoint('BOTTOMLEFT', container, 'BOTTOMLEFT', 0, offset)
+			bar:SetPoint('BOTTOMRIGHT', container, 'BOTTOMRIGHT', 0, offset)
+		else
+			bar:SetPoint('TOPLEFT', container, 'TOPLEFT', 0, -offset)
+			bar:SetPoint('TOPRIGHT', container, 'TOPRIGHT', 0, -offset)
+		end
+	end
+end
+
+---------------------------------------------------------------- aura scanning
+
+local function RelevantUnit(unit)
+	if type(unit) ~= 'string' then return false end
+	if unit == 'target' or unit == 'focus' then return true end
+	return Settings().plates and unit:find('^nameplate%d+$') ~= nil
+end
+
+local function AuraIDs(unit, filter)
+	local ok, ids = pcall(C_UnitAuras.GetUnitAuraInstanceIDs, unit, filter)
+	if ok and type(ids) == 'table' then return ids end
+	-- Older shape: full aura tables
+	local ok2, list = pcall(C_UnitAuras.GetUnitAuras, unit, filter)
+	if ok2 and type(list) == 'table' then
+		local out = {}
+		for _, a in ipairs(list) do out[#out + 1] = a.auraInstanceID end
+		return out
+	end
+	return nil, ids
+end
+
+local function SameUnit(a, b)
+	local ok, same = pcall(UnitIsUnit, a, b)
+	if not ok or IsSecret(same) then return false end
+	return same
+end
+
+-- Auras we know about, per unit token: tracked[unit][auraInstanceID] = auraData.
+-- In combat the client refuses to let addons enumerate auras ("secret" auras),
+-- so we build this list from the UNIT_AURA event payload instead and filter it
+-- with the ID-based filter check, which stays usable.
+local tracked = {}
+
+local function FilteredOut(unit, id, filter)
+	if not (C_UnitAuras and C_UnitAuras.IsAuraFilteredOutByInstanceID) then return false end
+	local ok, out = pcall(C_UnitAuras.IsAuraFilteredOutByInstanceID, unit, id, filter)
+	if not ok then
+		if TRACE then Print(('filter check failed on %s: %s'):format(unit, tostring(out))) end
+		return true
+	end
+	if IsSecret(out) then return false end
+	return out and true or false
+end
+
+local function TrackAdd(unit, data)
+	local id = data and data.auraInstanceID
+	if not id or IsSecret(id) then return end
+	if FilteredOut(unit, id, FILTER_ALL) then return end -- not our debuff
+	tracked[unit] = tracked[unit] or {}
+	tracked[unit][id] = data
+end
+
+-- Full rescan; only possible when the client lets us enumerate (usually out of combat).
+local function Rescan(unit)
+	local ids, err = AuraIDs(unit, FILTER_ALL)
+	if not ids then
+		if TRACE then Print(('rescan %s unavailable: %s'):format(unit, tostring(err))) end
+		return false
+	end
+	tracked[unit] = {}
+	for _, id in ipairs(ids) do
+		local ok, data = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unit, id)
+		if ok and data then TrackAdd(unit, data) end
+	end
+	return true
+end
+
+local function OnUnitAura(unit, info)
+	if info and (IsSecret(info) or IsSecret(info.isFullUpdate) or IsSecret(info.addedAuras)) then
+		-- In combat the client hides the whole payload from addons.
+		if TRACE then Print("payload for " .. unit .. " is secret (combat restriction)") end
+		return
+	end
+	if not info or info.isFullUpdate then
+		if not Rescan(unit) and info and info.isFullUpdate and not UnitExists(unit) then
+			tracked[unit] = nil
+		end
 	else
-		local t = bar.fadetime - bar.fadeelapsed
-		local a = t / bar.fadetime * SimpleCooldownTracker_settings.alpha
-		bar:SetAlpha(a)
-	end
-end
-
-function UpdateBars()
-	for i = 1, MAXBARS do
-		UpdateBar(BARS[i])
-	end
-end
-
-do
-	local function formatTime(t)
-		local h = floor(t / 3600)
-		local m = floor((t - h * 3600) / 60)
-		local s = t - (h * 3600 + m * 60)
-		if h > 0 then
-			return format('%d:%02d:02d', h, m, s)
-		elseif m > 0 then
-			return format('%d:%02d', m, s)
-		elseif s < 10 then
-			return format('%.1f', s)
-		else
-			return format('%.0f', s)
+		if info.addedAuras then
+			for _, data in ipairs(info.addedAuras) do TrackAdd(unit, data) end
 		end
-	end
-
-	function UpdateBar(bar)
-		if not LOCKED then
-			return
-		end
-
-		local timer = bar.timer
-
-		if timer.stopped then
-			if bar:GetAlpha() > 0 then
-				bar.spark:Hide()
-				bar.fadeelapsed = GetTime() - timer.stopped
-				FadeBar(bar)
+		if info.updatedAuraInstanceIDs and tracked[unit] then
+			for _, id in ipairs(info.updatedAuraInstanceIDs) do
+				if tracked[unit][id] then
+					local ok, data = pcall(C_UnitAuras.GetAuraDataByAuraInstanceID, unit, id)
+					if ok and data then tracked[unit][id] = data end
+				end
 			end
-		else
-			bar:SetAlpha(SimpleCooldownTracker_settings.alpha)
-			bar.icon:SetTexture(timer.texture or [[Interface\Icons\INV_Misc_QuestionMark]])
-			bar.text:SetText(timer.unit_name)
+		end
+		if info.removedAuraInstanceIDs and tracked[unit] then
+			for _, id in ipairs(info.removedAuraInstanceIDs) do tracked[unit][id] = nil end
+		end
+	end
+	if TRACE then
+		local n = 0
+		for _ in pairs(tracked[unit] or {}) do n = n + 1 end
+		Print(('tracked %s: %d player debuff(s)'):format(unit, n))
+	end
+end
 
-			local fraction
-			if timer.start then
-				local duration = timer.expiration - timer.start
-				local remaining = timer.expiration - GetTime()
-				fraction = remaining / duration
+local function Collect()
+	local s = Settings()
+	local filter = s.all and FILTER_ALL or FILTER_CC
+	local entries = {}
 
-				local invert = SimpleCooldownTracker_settings.invert and not timer.DR
-				
-				bar.statusbar:SetValue( invert and 1 - fraction or fraction)
+	local units = { 'target', 'focus' }
+	if s.plates then
+		for i = 1, 40 do units[#units + 1] = 'nameplate' .. i end
+	end
 
-				local sparkPosition = WIDTH * fraction
-				bar.spark:Show()
-				bar.spark:SetPoint('CENTER', bar.statusbar, invert and 'RIGHT' or 'LEFT', invert and -sparkPosition or sparkPosition, 0)
+	for idx, unit in ipairs(units) do
+		if tracked[unit] and UnitExists(unit) then
+			local skip = false
+			-- avoid showing the same mob twice (focus/nameplate duplicates of an earlier unit)
+			for j = 1, idx - 1 do
+				if UnitExists(units[j]) and SameUnit(unit, units[j]) then skip = true break end
+			end
+			if not skip then
+				for id, data in pairs(tracked[unit]) do
+					if not FilteredOut(unit, id, filter) then
+						local ok, dur = pcall(C_UnitAuras.GetAuraDuration, unit, id)
+						entries[#entries + 1] = { unit = unit, data = data, duration = ok and dur or nil }
+					end
+				end
+			end
+		end
+	end
+	return entries
+end
 
-				bar.timertext:SetText(formatTime(remaining))
+local function Refresh()
+	dirty = false
+	if not locked then return end
+	local entries = Collect()
+	local invert = Settings().invert
+	local alpha = Settings().alpha
+	for i = 1, MAXBARS do
+		local bar, e = bars[i], entries[i]
+		if e then
+			bar.entry = e
+			bar.icon:SetTexture(e.data.icon)
+			bar.text:SetText(UnitName(e.unit))
+			if e.duration then
+				bar.statusbar:SetTimerDuration(e.duration, 0, invert and 0 or 1)
 			else
-				fraction = 1
+				bar.statusbar:SetMinMaxValues(0, 1)
 				bar.statusbar:SetValue(1)
-				bar.spark:Hide()
-				bar.timertext:SetText()
 			end
-			local r, g, b
-			if timer.DR == 1 then
-				r, g, b = .9, .9, .3
-			elseif timer.DR == 2 then
-				r, g, b = .9, .6, 0
-			elseif timer.DR == 3 then
-				r, g, b = .9, .3, .3
-			else
-				r, g, b = .3, .9, .3
-			end
-			bar.statusbar:SetStatusBarColor(r, g, b)
-			bar.statusbar:SetBackdropColor(r, g, b, .3)
-		end
-	end
-end
-
-function UnlockBars()
-	LOCKED = false
-	BARS:EnableMouse(true)
-	for i = 1, MAXBARS do
-		local f = BARS[i]
-		f:SetAlpha(SimpleCooldownTracker_settings.alpha)
-		f.statusbar:SetStatusBarColor(1, 1, 1)
-		f.statusbar:SetValue(1)
-		f.icon:SetTexture[[Interface\Icons\INV_Misc_QuestionMark]]
-		f.text:SetText('SCT bar')
-		f.timertext:SetText((SimpleCooldownTracker_settings.growth == 'up' and i or MAXBARS - i + 1))
-		f.spark:Hide()
-	end
-end
-
-function LockBars()
-	LOCKED = true
-	BARS:EnableMouse(false)
-	for i = 1, MAXBARS do
-		BARS[i]:SetAlpha(0)
-	end
-end
-
-do
-	local factor = { [0] = 1, 1/2, 1/4, 0 }
-
-	function DiminishedDuration(unit, effect, full_duration)
-		if IsPlayer(unit) then
-			local class = DR_CLASS[effect]
-			local timer = class and TIMERS[class .. '@' .. unit]
-			local DR = timer and timer.DR or 0
-			return full_duration * factor[DR]
+			bar:SetAlpha(alpha)
+			bar:Show()
 		else
-			return full_duration
+			bar.entry = nil
+			bar:Hide()
 		end
 	end
 end
 
-function TargetDebuffs()
-	local debuffs = {}
-	local i = 1
-	while UnitDebuff('target', i) do
-		local debuff_name, _, _, _, _, _, source = UnitDebuff('target', i)
-		if source == 'player' then
-			debuffs[debuff_name] = true
-		end
-		i = i + 1
-	end
-	return debuffs
-end
-
-function UNIT_SPELLCAST_SENT(_, _, _, spell)
-	if IsSecret(spell) then return end
-	if SPECIAL_EVENT[spell] then
-		SetEffectDurations(spell)
-	end
-end
-
-function UNIT_SPELLCAST_SUCCEEDED(_, _, spell)
-	if IsSecret(spell) then return end
-	SetEffectDurations(spell)
-end
-
-function SetEffectDurations(spell)
-	local effects = SPELL_EFFECTS[spell] or {spell}
-	for _, effect in pairs(effects) do
-		local duration = DURATION[effect]
-		if duration then
-			if COMBO[effect] then
-				duration = duration + COMBO[effect] * GetComboPoints('player', 'target')
-			end
-			if BONUS[effect] then
-				duration = duration + BONUS[effect](duration)
-			end
-			EFFECT[GetSpellInfo(effect)] = { id = effect, duration = duration }
-		end
-	end
-end
-
-function AuraGone(unit, effect_name)
-	local key = effect_name .. '@' .. unit
-	local timer = TIMERS[key]
-	if timer then
-		StopTimer(key)
-	end
-end
-
-function ActivateDRTimer(timer, unit)
-	local dr_class = DR_CLASS[timer.effect]
-	if dr_class then
-		for k, v in pairs(DR_CLASS) do
-			if v == dr_class and EffectActive(k, unit) then
-				return
-			end
-		end
-		local timer = TIMERS[dr_class .. '@' .. unit]
-		if timer then
-			timer.start = GetTime()
-			timer.expiration = timer.start + 20
-		end
-		PlaceTimers()
-	end
-end
-
-function CHAT_MSG_COMBAT_HONOR_GAIN(_, _, _, _, player_name)
-	UnitDied(player_name)
-end
-
-function PLAYER_REGEN_ENABLED()
-	for k, timer in pairs(TIMERS) do
-		if not IsPlayer(timer.unit) and not OOC[timer.effect] then
-			StopTimer(k)
-		end
-	end
-end
-
-function PlaceTimers()
-	for _, timer in pairs(TIMERS) do
-		if not timer.visible and (not timer.DR or timer.DR > 1 or timer.expiration) then
-			local up = SimpleCooldownTracker_settings.growth == 'up'
-			for i = (up and 1 or MAXBARS), (up and MAXBARS or 1), (up and 1 or -1) do
-				if BARS[i].timer.stopped then
-					BARS[i].timer = timer
-					timer.visible = true
-					break
-				end
-			end
-		end
-	end
-end
-
-function UpdateTimers()
-	local t = GetTime()
-	for k, timer in pairs(TIMERS) do
-		if timer.expiration and t > timer.expiration then
-			StopTimer(k)
-		end
-	end
-end
-
-function EffectActive(effect, unit)
-	return TIMERS[GetSpellInfo(effect) .. '@' .. unit] and true or false
-end
-
-function StartTimer(effect, unit, unit_name, duration)
-	local effect_name, _, texture = GetSpellInfo(effect)
-
-	if SimpleCooldownTracker_settings.ignore[effect_name] then
-		return
-	end
-
-	if SimpleCooldownTracker_settings.aoe == 'target' and AOE[effect] and unit ~= LATEST_TARGET then
-		return
-	end
-
-	duration = DiminishedDuration(unit, effect, duration)
-
-	if duration == 0 then
-		return
-	end
-
-	local key = effect_name .. '@' .. unit
-	local timer = TIMERS[key] or {}
-
-	if UNIQUENESS_CLASS[effect] then
-		for k, v in pairs(TIMERS) do
-			if v ~= timer and not v.DR and UNIQUENESS_CLASS[v.effect] == UNIQUENESS_CLASS[effect] then
-				StopTimer(k)
-			end
-		end
-	end
-
-	TIMERS[key] = timer
-
-	timer.effect = effect
-	timer.effect_name = effect_name
-	timer.unit = unit
-	timer.unit_name = unit_name
-	timer.start = GetTime()
-	timer.expiration = timer.start + duration
-	timer.texture = texture
-
-	if IsPlayer(unit) then
-		StartDR(timer, unit)
-	end
-
-	timer.stopped = nil
-	PlaceTimers()
-end
-
-function StartDR(effect_timer, unit)
-	local dr_class = DR_CLASS[effect_timer.effect]
-	if dr_class then
-		local key = dr_class .. '@' .. unit
-		local timer = TIMERS[key] or {}
-
-		if not timer.DR or timer.DR < 3 then
-			TIMERS[key] = timer
-
-			timer.effect_name = effect_timer.effect_name
-			timer.unit = unit
-			timer.unit_name = effect_timer.unit_name
-			timer.start = nil
-			timer.expiration = nil
-			timer.DR = min(3, (timer.DR or 0) + 1)
-			timer.texture = effect_timer.texture
-
-			PlaceTimers()
-		end
-	end
-end
-
-function StopTimer(key)
-	local timer = TIMERS[key]
-	TIMERS[key] = nil
-	timer.stopped = GetTime()
-	if not timer.DR then
-		ActivateDRTimer(timer, timer.unit)
-	end
-	PlaceTimers()
-end
-
-function UnitDied(unit) -- TODO retail does aura gone not fire when unit dies?
-	for k, timer in pairs(TIMERS) do
-		if timer.unit == unit then
-			StopTimer(k)
-		end
-	end
-end
-
-function COMBAT_LOG_EVENT_UNFILTERED()
-	local _, event, _, source, _, _, _, unit, unit_name, _, _, spell, effect_name = CombatLogGetCurrentEventInfo()
-
-	if IsSecret(event) or IsSecret(source) or IsSecret(unit) or IsSecret(effect_name) then
-		return
-	end
-
-	if event == 'UNIT_DIED' then
-		UnitDied(unit)
-		return
-	end
-
-	if source ~= UnitGUID'player' and source ~= UnitGUID'pet' then
-		return
-	end
-
-	if event == 'SPELL_AURA_APPLIED' or event == 'SPELL_AURA_REFRESH' then
-		local effect_info = EFFECT[effect_name]
-		if effect_info then
-			StartTimer(effect_info.id, unit, unit_name, effect_info.duration)
-			return
-		end
-		local effect, duration
-		if effect_name == GetSpellInfo(6358) then -- Seduction
-			effect = 6358
-			local _, _, _, _, rank = GetTalentInfo(2, 7)
-			duration = 15 * (1 + rank * .1)
-		elseif effect_name == GetSpellInfo(11201) then -- Crippling Poison
-			effect = 11201
-			duration = 12
-		elseif effect_name == GetSpellInfo(13810) then -- Frost Trap Aura
-			effect = 13810
-			duration = 30
-		elseif effect_name == GetSpellInfo(15269) then -- Blackout
-			effect = 15269
-			duration = 3
-		elseif effect_name == GetSpellInfo(20170) then -- Stun
-			effect = 20170
-			duration = 2
-		elseif effect_name == GetSpellInfo(12360) then -- Impact
-			effect = 12360
-			duration = 2
-		elseif effect_name == GetSpellInfo(18118) then -- Aftermath
-			effect = 18118
-			duration = 5
-		elseif effect_name == GetSpellInfo(12494) then -- Frostbite
-			effect = 12494
-			duration = 5
-		elseif effect_name == GetSpellInfo(19229) then -- Improved Wing Clip
-			effect = 19229
-			duration = 5
-		elseif effect_name == GetSpellInfo(23694) then -- Improved Hamstring
-			effect = 23694
-			duration = 5
-		elseif effect_name == GetSpellInfo(18425) then -- Kick - Silenced
-			effect = 18425
-			duration = 2
-		elseif effect_name == GetSpellInfo(18469) then -- Counterspell - Silenced
-			effect = 18469
-			duration = 4
-		elseif effect_name == GetSpellInfo(18498) then -- Shield Bash - Silenced
-			effect = 18498
-			duration = 3
-		elseif effect_name == GetSpellInfo(5530) then -- Mace Stun Effect
-			effect = 5530
-			duration = 3
-		end
-		if effect then
-			StartTimer(effect, unit, unit_name, duration)
-		end
-	elseif event == 'SPELL_AURA_REMOVED' then
-		AuraGone(unit, effect_name)
-	end
-end
-
-do
-	local isPlayer = {}
-
-	function PLAYER_TARGET_CHANGED()
-		local target_guid = UnitGUID'target'
-		if target_guid then
-			LATEST_TARGET = target_guid
-			if UnitIsPlayer'target' or UnitPlayerControlled'target' then
-				isPlayer[target_guid] = true
-			end
-		end
-	end
-
-	function IsPlayer(guid)
-		return isPlayer[guid]
-	end
-end
-
-CreateFrame'Frame':SetScript('OnUpdate', function()
-	UpdateTimers()
-	if not LOCKED then
-		return
-	end
-	UpdateBars()
-end)
-
-do
-	local defaultSettings = {
-		invert = false,
-		growth = 'up',
-		scale = 1,
-		alpha = .85,
-		aoe = 'target',
-		ignore = {},
-	}
-
-	function ADDON_LOADED(name)
-		if name ~= addon_name then
-            return
-        end
-
-		for k, v in pairs(defaultSettings) do
-			if SimpleCooldownTracker_settings[k] == nil then
-				SimpleCooldownTracker_settings[k] = v
-			end
-		end
-		
-		local dummyTimer = { stopped = 0 }
-		local height = HEIGHT * MAXBARS + 4 * (MAXBARS - 1)
-		BARS = CreateFrame('Frame', 'SimpleCooldownTracker', UIParent)
-		BARS:SetWidth(WIDTH + HEIGHT)
-		BARS:SetHeight(height)
-		BARS:SetMovable(true)
-		BARS:SetUserPlaced(true)
-		BARS:SetClampedToScreen(true)
-		BARS:SetScript('OnMouseDown', function(self)
-			self:StartMoving()
-		end)
-		BARS:SetScript('OnMouseUp', function(self)
-			self:StopMovingOrSizing()
-		end)
-		BARS:SetPoint('CENTER', 0, 150)
-		for i = 1, MAXBARS do
-			local bar = CreateBar()
-			bar:SetParent(BARS)
-			bar:SetAlpha(SimpleCooldownTracker_settings.alpha)
-			local offset = 20 * (i - 1)
-			bar:SetPoint('BOTTOMLEFT', 0, offset)
-			bar:SetPoint('BOTTOMRIGHT', 0, offset)
-			bar.timer = dummyTimer
-			tinsert(BARS, bar)
-		end
-
-		BARS:SetScale(SimpleCooldownTracker_settings.scale)
-
-		_G.SLASH_CCC1 = '/sct'
-		_G.SLASH_CCC2 = '/ccc'
-		SlashCmdList.CCC = SlashCommandHandler
-
-		LockBars()
-	end
-
-	Print('loaded - /sct')
-end
-
-do
-	local function tokenize(str)
-		local tokens = {}
-		for token in string.gmatch(str, '%S+') do
-			tinsert(tokens, token)
-		end
-		return tokens
-	end
-
-	function SlashCommandHandler(command)
-		if command then
-			local args = tokenize(command)
-			if command == 'unlock' then
-				UnlockBars()
-				Print('Bars unlocked.')
-			elseif command == 'lock' then
-				LockBars()
-				Print('Bars locked.')
-			elseif command == 'invert' then
-				SimpleCooldownTracker_settings.invert = not SimpleCooldownTracker_settings.invert
-				Print('Bar inversion ' .. (SimpleCooldownTracker_settings.invert and 'on.' or 'off.'))
-			elseif args[1] == 'growth' and (args[2] == 'up' or args[2] == 'down') then
-				SimpleCooldownTracker_settings.growth = args[2]
-				Print('Growth: ' .. args[2])
-				if not LOCKED then UnlockBars() end
-			elseif args[1] == 'scale' then
-				local scale = tonumber(args[2])
-				if scale then
-					scale = max(.5, min(3, scale))
-					SimpleCooldownTracker_settings.scale = scale
-					BARS:SetScale(scale)
-					Print('Scale: ' .. scale)
-				else
-					Usage()
-				end
-			elseif args[1] == 'alpha' then
-				local alpha = tonumber(args[2])
-				if alpha then
-					alpha = max(0, min(1, alpha))
-					SimpleCooldownTracker_settings.alpha = alpha
-					if not LOCKED then UnlockBars() end
-					Print('Alpha: ' .. alpha)
-				else
-					Usage()
-				end
-			elseif args[1] == 'aoe' and (args[2] == 'target' or args[2] == 'all') then
-				SimpleCooldownTracker_settings.aoe = args[2]
-				Print('AOE: ' .. args[2])
-				if not LOCKED then UnlockBars() end
-			elseif command == 'ignore' then
-				for effect_name in pairs(SimpleCooldownTracker_settings.ignore) do
-					Print('Ignored effects:')
-					Print('  ' .. effect_name)
-				end
-			elseif args[1] == 'ignore' then
-				local _, _, effect_name = strfind(command, '^%s*ignore%s+(.*)')
-				SimpleCooldownTracker_settings.ignore[effect_name] = not SimpleCooldownTracker_settings.ignore[effect_name] or nil
-				Print('Ignoring "' .. effect_name .. '" ' .. (SimpleCooldownTracker_settings.ignore[effect_name] and 'on. ' or 'off.'))
+local function UpdateTimerTexts()
+	for i = 1, MAXBARS do
+		local bar = bars[i]
+		local e = bar.entry
+		if e and bar:IsShown() then
+			if e.duration then
+				local ok = pcall(function()
+					bar.timertext:SetFormattedText('%.1f', e.duration:GetRemainingDuration())
+				end)
+				if not ok then bar.timertext:SetText('') end
 			else
-				Usage()
+				bar.timertext:SetText('')
 			end
 		end
 	end
 end
 
-function Usage()
+---------------------------------------------------------------- lock / unlock
+
+local function Unlock()
+	locked = false
+	container:EnableMouse(true)
+	for i, bar in ipairs(bars) do
+		bar.entry = nil
+		bar:SetAlpha(Settings().alpha)
+		bar.statusbar:SetMinMaxValues(0, 1)
+		bar.statusbar:SetValue(1)
+		bar.icon:SetTexture([[Interface\Icons\INV_Misc_QuestionMark]])
+		bar.text:SetText('SCT bar')
+		bar.timertext:SetText(Settings().growth == 'up' and i or MAXBARS - i + 1)
+		bar:Show()
+	end
+end
+
+local function Lock()
+	locked = true
+	container:EnableMouse(false)
+	for _, bar in ipairs(bars) do
+		bar.timertext:SetText('')
+		bar:Hide()
+	end
+	dirty = true
+end
+
+---------------------------------------------------------------- slash commands
+
+local function Usage()
 	Print('Usage:')
 	Print('  lock | unlock')
 	Print('  invert')
 	Print('  growth (up | down)')
 	Print('  scale [0.5,3]')
 	Print('  alpha [0,1]')
-	Print('  aoe (target | all)')
-	Print('  ignore {name}')
-	Print('  ignore')
+	Print('  plates   (toggle tracking on nameplates)')
+	Print('  all      (toggle showing all your debuffs, not only CCs)')
+	Print('  debug    (print what the addon sees on your target)')
+	Print('  trace    (toggle printing every aura event, for debugging)')
+	Print('  probe [spellID]  (test which aura lookups work; try in combat)')
 end
+
+local function Debug()
+	local unit = 'target'
+	Print(('debug: locked=%s bars=%d'):format(tostring(locked), #bars))
+	Print(('debug: C_UnitAuras=%s GetUnitAuraInstanceIDs=%s GetAuraDuration=%s SetTimerDuration=%s'):format(
+		tostring(C_UnitAuras ~= nil), tostring(C_UnitAuras and C_UnitAuras.GetUnitAuraInstanceIDs ~= nil),
+		tostring(C_UnitAuras and C_UnitAuras.GetAuraDuration ~= nil),
+		tostring(bars[1] and bars[1].statusbar.SetTimerDuration ~= nil)))
+	if not UnitExists(unit) then Print('debug: no target') return end
+	for _, filter in ipairs({ FILTER_CC, FILTER_ALL }) do
+		local ids, err = AuraIDs(unit, filter)
+		Print(('debug: [%s] -> %s'):format(filter, ids and (#ids .. ' aura(s)') or ('unavailable: ' .. tostring(err))))
+		for _, id in ipairs(ids or {}) do
+			local data = C_UnitAuras.GetAuraDataByAuraInstanceID(unit, id)
+			local dur = C_UnitAuras.GetAuraDuration and C_UnitAuras.GetAuraDuration(unit, id)
+			Print(('  id=%s data=%s duration=%s name=%s'):format(tostring(id), data and 'yes' or 'no', dur and 'yes' or 'no',
+				data and (IsSecret(data.name) and '<secret>' or tostring(data.name)) or '?'))
+		end
+	end
+end
+
+-- Try every aura lookup the client offers against the target, so we can see
+-- which (if any) still work in combat. Usage: /sct probe <spellID of a debuff you applied>
+local function Probe(spellID)
+	local unit = 'target'
+	if not UnitExists(unit) then Print('probe: no target') return end
+	Print(('probe: inCombat=%s'):format(tostring(InCombatLockdown())))
+	local function try(label, fn, ...)
+		local ok, a = pcall(fn, ...)
+		local desc
+		if not ok then desc = 'ERROR ' .. tostring(a)
+		elseif a == nil then desc = 'nil'
+		elseif IsSecret(a) then desc = 'secret value'
+		elseif type(a) == 'table' then
+			local n = 0
+			for _ in pairs(a) do n = n + 1 end
+			desc = 'table (' .. n .. ' entries)'
+		else desc = tostring(a) end
+		Print(('probe: %s -> %s'):format(label, desc))
+	end
+	try('GetUnitAuraInstanceIDs HARMFUL|PLAYER', C_UnitAuras.GetUnitAuraInstanceIDs, unit, FILTER_ALL)
+	try('GetUnitAuras HARMFUL|PLAYER', C_UnitAuras.GetUnitAuras, unit, FILTER_ALL)
+	try('GetAuraDataByIndex(1)', C_UnitAuras.GetAuraDataByIndex, unit, 1, FILTER_ALL)
+	if spellID then
+		try('GetUnitAuraBySpellID(' .. spellID .. ')', C_UnitAuras.GetUnitAuraBySpellID, unit, spellID)
+		local name = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(spellID)
+		if name then try('GetAuraDataBySpellName(' .. name .. ')', C_UnitAuras.GetAuraDataBySpellName, unit, name, FILTER_ALL) end
+	end
+	if C_Secrets then
+		for _, fn in ipairs({ 'ShouldAurasBeSecret', 'HasSecretRestrictions' }) do
+			if C_Secrets[fn] then try('C_Secrets.' .. fn, C_Secrets[fn]) end
+		end
+	end
+end
+
+local function Slash(msg)
+	local s = Settings()
+	local cmd, arg = (msg or ''):match('^%s*(%S*)%s*(.-)%s*$')
+	cmd = cmd:lower()
+	if cmd == 'unlock' then Unlock() Print('Bars unlocked.')
+	elseif cmd == 'lock' then Lock() Print('Bars locked.')
+	elseif cmd == 'invert' then
+		s.invert = not s.invert
+		Print('Bar inversion ' .. (s.invert and 'on.' or 'off.'))
+		dirty = true
+	elseif cmd == 'growth' and (arg == 'up' or arg == 'down') then
+		s.growth = arg
+		PositionBars()
+		Print('Growth: ' .. arg)
+		if not locked then Unlock() end
+	elseif cmd == 'scale' and tonumber(arg) then
+		s.scale = math.max(.5, math.min(3, tonumber(arg)))
+		container:SetScale(s.scale)
+		Print('Scale: ' .. s.scale)
+	elseif cmd == 'alpha' and tonumber(arg) then
+		s.alpha = math.max(0, math.min(1, tonumber(arg)))
+		Print('Alpha: ' .. s.alpha)
+		if not locked then Unlock() else dirty = true end
+	elseif cmd == 'plates' then
+		s.plates = not s.plates
+		Print('Nameplate tracking ' .. (s.plates and 'on.' or 'off.'))
+		dirty = true
+	elseif cmd == 'all' then
+		s.all = not s.all
+		Print('Showing ' .. (s.all and 'all of your debuffs.' or 'crowd controls only.'))
+		dirty = true
+	elseif cmd == 'debug' then
+		local ok, err = pcall(Debug)
+		if not ok then Print('debug error: ' .. tostring(err)) end
+	elseif cmd == 'probe' then
+		local ok, err = pcall(Probe, tonumber(arg))
+		if not ok then Print('probe error: ' .. tostring(err)) end
+	elseif cmd == 'trace' then
+		TRACE = not TRACE
+		Print('Event trace ' .. (TRACE and 'on (watch chat while applying a CC).' or 'off.'))
+	else Usage() end
+end
+
+---------------------------------------------------------------- events
+
+local f = CreateFrame('Frame')
+f:RegisterEvent('ADDON_LOADED')
+f:SetScript('OnEvent', function(self, event, arg1, arg2)
+	if event == 'ADDON_LOADED' then
+		if arg1 ~= ADDON then return end
+		self:UnregisterEvent('ADDON_LOADED')
+
+		SimpleCooldownTracker_settings = SimpleCooldownTracker_settings or {}
+		for k, v in pairs(defaults) do
+			if SimpleCooldownTracker_settings[k] == nil then SimpleCooldownTracker_settings[k] = v end
+		end
+		local s = Settings()
+
+		container = CreateFrame('Frame', 'SimpleCooldownTracker', UIParent)
+		container:SetSize(WIDTH + HEIGHT, (HEIGHT + SPACING) * MAXBARS - SPACING)
+		container:SetMovable(true)
+		container:SetClampedToScreen(true)
+		container:SetUserPlaced(true)
+		container:SetScale(s.scale)
+		container:SetPoint('CENTER', 0, 150)
+		container:SetScript('OnMouseDown', function(c) c:StartMoving() end)
+		container:SetScript('OnMouseUp', function(c) c:StopMovingOrSizing() end)
+
+		-- SetScript('OnMouseDown') enables mouse input; the locked state must not
+		-- swallow clicks (e.g. right-click camera rotation).
+		container:EnableMouse(false)
+
+		for i = 1, MAXBARS do bars[i] = CreateBar() end
+		PositionBars()
+
+		SLASH_SIMPLECOOLDOWNTRACKER1 = '/sct'
+		SLASH_SIMPLECOOLDOWNTRACKER2 = '/ccc'
+		SlashCmdList.SIMPLECOOLDOWNTRACKER = Slash
+
+		self:RegisterEvent('UNIT_AURA')
+		self:RegisterEvent('PLAYER_TARGET_CHANGED')
+		self:RegisterEvent('PLAYER_FOCUS_CHANGED')
+		self:RegisterEvent('NAME_PLATE_UNIT_ADDED')
+		self:RegisterEvent('NAME_PLATE_UNIT_REMOVED')
+		Print('loaded - /sct')
+	elseif event == 'UNIT_AURA' then
+		if TRACE then Print('UNIT_AURA ' .. tostring(IsSecret(arg1) and '<secret>' or arg1) .. (RelevantUnit(arg1) and ' (relevant)' or ' (ignored)')) end
+		if RelevantUnit(arg1) then
+			OnUnitAura(arg1, arg2)
+			dirty = true
+		end
+	elseif event == "NAME_PLATE_UNIT_REMOVED" then
+		if type(arg1) == "string" then tracked[arg1] = nil end
+		dirty = true
+	elseif event == "PLAYER_TARGET_CHANGED" or event == "PLAYER_FOCUS_CHANGED" or event == "NAME_PLATE_UNIT_ADDED" then
+		local unit = event == "PLAYER_TARGET_CHANGED" and "target" or event == "PLAYER_FOCUS_CHANGED" and "focus" or arg1
+		if type(unit) == "string" and RelevantUnit(unit) then
+			tracked[unit] = nil
+			Rescan(unit)
+		end
+		dirty = true
+	else
+		dirty = true
+	end
+end)
+
+local elapsed = 0
+f:SetScript('OnUpdate', function(_, dt)
+	if not locked then return end
+	if dirty then Refresh() end
+	elapsed = elapsed + dt
+	if elapsed > .05 then
+		elapsed = 0
+		UpdateTimerTexts()
+	end
+end)
