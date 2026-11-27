@@ -122,12 +122,12 @@ local function Collect()
 				if UnitExists(units[j]) and SameUnit(unit, units[j]) then skip = true break end
 			end
 			if not skip then
-				local ids = AuraIDs(unit, filter)
-				if not ids and filter == FILTER_CC then
-					ccFilterOK = false
-					Print('CROWD_CONTROL aura filter unavailable; showing all of your debuffs instead.')
-					ids = AuraIDs(unit, FILTER_ALL)
+				local ids, err = AuraIDs(unit, filter)
+				if not ids then
+					Print(("aura query failed on %s [%s]: %s"):format(unit, filter, tostring(err)))
+					if filter == FILTER_CC then ids = AuraIDs(unit, FILTER_ALL) end
 				end
+				if TRACE then Print(("scan %s [%s] -> %s"):format(unit, filter, ids and #ids or "nil")) end
 				for _, id in ipairs(ids or {}) do
 					local data = C_UnitAuras.GetAuraDataByAuraInstanceID(unit, id)
 					if data then
