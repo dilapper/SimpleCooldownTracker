@@ -144,6 +144,11 @@ local function Rescan(unit)
 end
 
 local function OnUnitAura(unit, info)
+	if info and (IsSecret(info) or IsSecret(info.isFullUpdate) or IsSecret(info.addedAuras)) then
+		-- In combat the client hides the whole payload from addons.
+		if TRACE then Print("payload for " .. unit .. " is secret (combat restriction)") end
+		return
+	end
 	if not info or info.isFullUpdate then
 		if not Rescan(unit) and info and info.isFullUpdate and not UnitExists(unit) then
 			tracked[unit] = nil
@@ -285,6 +290,7 @@ local function Usage()
 	Print('  all      (toggle showing all your debuffs, not only CCs)')
 	Print('  debug    (print what the addon sees on your target)')
 	Print('  trace    (toggle printing every aura event, for debugging)')
+	Print('  probe [spellID]  (test which aura lookups work; try in combat)')
 end
 
 local function Debug()
@@ -303,6 +309,40 @@ local function Debug()
 			local dur = C_UnitAuras.GetAuraDuration and C_UnitAuras.GetAuraDuration(unit, id)
 			Print(('  id=%s data=%s duration=%s name=%s'):format(tostring(id), data and 'yes' or 'no', dur and 'yes' or 'no',
 				data and (IsSecret(data.name) and '<secret>' or tostring(data.name)) or '?'))
+		end
+	end
+end
+
+-- Try every aura lookup the client offers against the target, so we can see
+-- which (if any) still work in combat. Usage: /sct probe <spellID of a debuff you applied>
+local function Probe(spellID)
+	local unit = 'target'
+	if not UnitExists(unit) then Print('probe: no target') return end
+	Print(('probe: inCombat=%s'):format(tostring(InCombatLockdown())))
+	local function try(label, fn, ...)
+		local ok, a = pcall(fn, ...)
+		local desc
+		if not ok then desc = 'ERROR ' .. tostring(a)
+		elseif a == nil then desc = 'nil'
+		elseif IsSecret(a) then desc = 'secret value'
+		elseif type(a) == 'table' then
+			local n = 0
+			for _ in pairs(a) do n = n + 1 end
+			desc = 'table (' .. n .. ' entries)'
+		else desc = tostring(a) end
+		Print(('probe: %s -> %s'):format(label, desc))
+	end
+	try('GetUnitAuraInstanceIDs HARMFUL|PLAYER', C_UnitAuras.GetUnitAuraInstanceIDs, unit, FILTER_ALL)
+	try('GetUnitAuras HARMFUL|PLAYER', C_UnitAuras.GetUnitAuras, unit, FILTER_ALL)
+	try('GetAuraDataByIndex(1)', C_UnitAuras.GetAuraDataByIndex, unit, 1, FILTER_ALL)
+	if spellID then
+		try('GetUnitAuraBySpellID(' .. spellID .. ')', C_UnitAuras.GetUnitAuraBySpellID, unit, spellID)
+		local name = C_Spell and C_Spell.GetSpellName and C_Spell.GetSpellName(spellID)
+		if name then try('GetAuraDataBySpellName(' .. name .. ')', C_UnitAuras.GetAuraDataBySpellName, unit, name, FILTER_ALL) end
+	end
+	if C_Secrets then
+		for _, fn in ipairs({ 'ShouldAurasBeSecret', 'HasSecretRestrictions' }) do
+			if C_Secrets[fn] then try('C_Secrets.' .. fn, C_Secrets[fn]) end
 		end
 	end
 end
@@ -341,6 +381,9 @@ local function Slash(msg)
 	elseif cmd == 'debug' then
 		local ok, err = pcall(Debug)
 		if not ok then Print('debug error: ' .. tostring(err)) end
+	elseif cmd == 'probe' then
+		local ok, err = pcall(Probe, tonumber(arg))
+		if not ok then Print('probe error: ' .. tostring(err)) end
 	elseif cmd == 'trace' then
 		TRACE = not TRACE
 		Print('Event trace ' .. (TRACE and 'on (watch chat while applying a CC).' or 'off.'))
