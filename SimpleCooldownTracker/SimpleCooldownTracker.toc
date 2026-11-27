@@ -1,6 +1,6 @@
 ## Interface: 16001
 ## Title: SimpleCooldownTracker
-## Notes: Progress bars for your crowd controls on your target, focus and nameplates. Inspired by ccc by Simon Hirsig.
+## Notes: DEPRECATED - does not work on WoW Forever (aura data is secret in combat). Inspired by ccc by Simon Hirsig.
 ## Author: dilapper (inspired by ccc by Simon Hirsig)
 ## Version: 2.0.0
 ## SavedVariablesPerCharacter: SimpleCooldownTracker_settings
